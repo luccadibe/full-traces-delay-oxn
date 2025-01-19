@@ -28,151 +28,368 @@ import json
 import glob
 import pandas as pd
 import matplotlib.pyplot as plt
-from pathlib import Path
 import seaborn as sns
+from pathlib import Path
+import argparse
+from typing import Dict, List, Any
 
-def load_traces(batch_id):
-    """Load all trace files for a given batch ID."""
-    traces_data = []
-    
-    # Find all trace files for this batch
-    trace_files = glob.glob(f"batch_{batch_id}_*_frontend_traces.json")
-    
-    for file_path in trace_files:
-        # Extract sub_experiment_id and run_id from filename
-        parts = file_path.split('_')
-        sub_exp_id = int(parts[2]) # the third part
-        run_id = int(parts[3]) # the fourth part
-        report_file_path = f"batch_{batch_id}_{sub_exp_id}_report.yaml" # this file actually contains JSON...
-        report_data = {}
-        with open(report_file_path, 'r') as f:
-            report_data = json.load(f)
+LOSS_TREATMENT_KEY = "loss_treatment"
+DELAY_TREATMENT_KEY = "delay_treatment"
+EXPERIMENT_METRICS_LOG = "delay-19/delay-metrics.log"
+
+# Total cluster resources (replace with actual values)
+total_cpu = 12000  # Milli CPU - 3 x e2-standard-4
+total_memory = 48 * 1024 * 1024 * 1024  # Bytes - 48GB
+
+class ExperimentAnalyzer:
+    def __init__(self, directory: str, treatment_type: str, service_filter: List[str]):
+        self.directory = Path(directory)
+        self.batch_id = self._get_batch_id()
+        self.params_mapping = self._load_params_mapping()
+        self.traces_df = None
+        self.configs = None
+        self.treatment_type = treatment_type
+        self.service_filter = service_filter
+        self.cpu_usage = []
+        self.cpu_usage_df = None
+        self.memory_usage = []
+        self.memory_usage_df = None
+        self.metrics_df = None
+
+    def _get_batch_id(self) -> str:
+        """Extract batch ID from the first matching file in directory."""
+        files = list(self.directory.glob("batch_*"))
+        if not files:
+            raise ValueError(f"No batch files found in {self.directory}")
+        
+        # Extract batch ID from first file
+        batch_id = files[0].name.split('_')[1]
+        return batch_id
+
+    def _load_params_mapping(self) -> Dict[int, Dict[str, Any]]:
+        """Load the parameters to sub-experiment ID mapping."""
+        params_file = self.directory / f"batch_{self.batch_id}_params_to_id.json"
+        if not params_file.exists():
+            print(f"Warning: No params mapping file found at {params_file}")
+            return {}
+        
+        with open(params_file) as f:
+            mapping = json.load(f)
+        
+        # Convert to dictionary with sub_experiment_id as key
+        return {item['sub_experiment_id']: item for item in mapping}
+
+    def load_traces(self) -> pd.DataFrame:
+        """Load all trace files for the batch."""
+        traces_data = []
+        trace_files = list(self.directory.glob(f"batch_{self.batch_id}_*_traces.json"))
+        print(f"{len(trace_files)} trace files detected")
+        for file_path in trace_files:
+            # Extract sub_experiment_id and run_id from filename
+            parts = file_path.stem.split('_')
+            sub_exp_id = int(parts[2])
+            run_id = int(parts[3])
             
-        # Get list of run IDs in order they appear
-        ordered_run_ids = list(report_data['report']['runs'].keys())
+            # Try to load corresponding report file
+            report_file = self.directory / f"batch_{self.batch_id}_{sub_exp_id}_report.yaml"
+            report_data = {}
+            if report_file.exists():
+                with open(report_file) as f:
+                    report_data = json.load(f)
+                ordered_run_ids = list(report_data['report']['runs'].keys())
+            
+            with open(file_path) as f:
+                traces = json.load(f)
+                for trace in traces:
+                    trace['sub_experiment_id'] = sub_exp_id
+                    trace['run_id'] = run_id
+                    
+                    # Add experiment parameters from mapping
+                    if sub_exp_id in self.params_mapping:
+                        for key, value in self.params_mapping[sub_exp_id].items():
+                            if key != 'sub_experiment_id':
+                                trace[key] = value
+                    
+                    # Add report data if available
+                    if report_data and 'report' in report_data:
+                        actual_run_id = ordered_run_ids[run_id]
+                        run_data = report_data['report']['runs'][actual_run_id]['loadgen']
+                        trace['loadgen_start_time'] = run_data.get('loadgen_start_time')
+                        trace['loadgen_end_time'] = run_data.get('loadgen_end_time')
+                
+                traces_data.extend(traces)
+        
+        self.traces_df = pd.DataFrame(traces_data)
+        return self.traces_df
 
-        with open(file_path, 'r') as f:
-            traces = json.load(f)
-            # Add metadata to each trace
-            for trace in traces:
-                trace['sub_experiment_id'] = sub_exp_id
-                trace['run_id'] = run_id
-                # Map run_id to the corresponding position in ordered_run_ids
-                actual_run_id = ordered_run_ids[run_id]
-                trace['loadgen_start_time'] = report_data['report']['runs'][actual_run_id]['loadgen']['loadgen_start_time']
-                trace['loadgen_end_time'] = report_data['report']['runs'][actual_run_id]['loadgen']['loadgen_end_time']
-            traces_data.extend(traces)
+    def load_configs(self) -> Dict[int, Dict]:
+        """Load all configuration files."""
+        configs = {}
+        config_files = list(self.directory.glob(f"batch_{self.batch_id}_*_config.json"))
+        
+        for file_path in config_files:
+            sub_exp_id = int(file_path.stem.split('_')[2])
+            with open(file_path) as f:
+                configs[sub_exp_id] = json.load(f)
+        
+        self.configs = configs
+        return configs
     
-    return pd.DataFrame(traces_data)
+    def load_cpu_usage(self):
+        """Load all cpu usage files for the batch."""
+        # cpu usage files are named as "batch_<batch_id>_<sub_experiment_id>_<run_id>_cpu_usage.json"
+        cpu_usage_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_cpu_usage.json"))
+        print(f"{len(cpu_usage_files)} cpu usage files detected")
+        for file_path in cpu_usage_files:
+            # Extract sub_experiment_id and run_id from filename
+            parts = file_path.stem.split('_')
+            sub_exp_id = int(parts[2])
+            run_id = int(parts[3])
+            
+            with open(file_path) as f:
+                cpu_usage = json.load(f)
+                for record in cpu_usage:
+                    record['sub_experiment_id'] = sub_exp_id
+                    record['run_id'] = run_id
+                self.cpu_usage.extend(cpu_usage)
+                
+        self.cpu_usage_df = pd.DataFrame(self.cpu_usage)
+        return self.cpu_usage_df
+    
+    def load_memory_usage(self):
+        """Load all memory usage files for the batch."""
+        # memory usage files are named as "batch_<batch_id>_<sub_experiment_id>_<run_id>_memory_available.json"
+        memory_usage_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_memory_available.json"))
+        print(f"{len(memory_usage_files)} memory usage files detected")
+        for file_path in memory_usage_files:
+            # Extract sub_experiment_id and run_id from filename
+            parts = file_path.stem.split('_')
+            sub_exp_id = int(parts[2])
+            run_id = int(parts[3])
+            
+            with open(file_path) as f:
+                memory_usage = json.load(f)
+                for record in memory_usage:
+                    record['sub_experiment_id'] = sub_exp_id
+                    record['run_id'] = run_id
+                self.memory_usage.extend(memory_usage)
+        self.memory_usage_df = pd.DataFrame(self.memory_usage)
+        return self.memory_usage_df
+    def load_metrics_logs(self):
+        """Load the metrics gathered using the kube metrics server"""
 
-def load_configs(batch_id):
-    """Load all configuration files for a given batch ID."""
-    configs = {}
-    config_files = glob.glob(f"batch_{batch_id}_*_config.json")
-    
-    for file_path in config_files:
-        sub_exp_id = int(file_path.split('_')[2])
-        with open(file_path, 'r') as f:
-            configs[sub_exp_id] = json.load(f)
-    
-    return configs
+        # Read and parse log file
+        log_file = EXPERIMENT_METRICS_LOG
+        rows = []
 
-def analyze_batch(batch_id="11736941878"):
-    # Load all data
-    df = load_traces(batch_id)
-    configs = load_configs(batch_id)
-    
-    # Convert duration from microseconds to milliseconds
-    df['duration'] = df['duration'] / 1000
-    
-    # Create a mapping of sub_experiment_id to delay configuration
-    delay_configs = {}
-    counter = 0
-    for sub_exp_id, config in configs.items():
-        delay_treatment = next(t for t in config['spec']['experiment']['treatments'] 
-                             if 'delay_treatment' in t)['delay_treatment']
-        delay_configs[sub_exp_id] = {
-            'delay_time': delay_treatment['params']['delay_time'],
-            'delay_jitter': delay_treatment['params']['delay_jitter'],
-            'duration': delay_treatment['params']['duration']
-        }
-        counter += 1
-    print(delay_configs)
-    print(counter)
-    
-    # Add configuration details to the DataFrame
-    df['delay_time'] = df['sub_experiment_id'].map(
-        lambda x: delay_configs[x]['delay_time'])
-    
-    df['delay_duration'] = df['sub_experiment_id'].map(
-        lambda x: delay_configs[x]['duration'])
-    
-    # Analysis of duration by operation and delay configuration
-    plt.figure(figsize=(12, 6))
-    sns.boxplot(data=df, x='delay_time', y='duration', hue='operation')
-    plt.title('Operation Duration by Delay Configuration')
-    plt.xlabel('Configured Delay Time')
-    plt.ylabel('Duration (milliseconds)')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig('duration_analysis.png')
-    
-    # Calculate summary statistics
-    summary_stats = df.groupby(['sub_experiment_id', 'delay_time', 'operation'])[['duration']].agg([
-        'mean', 'std', 'min', 'max', 'count'
-    ]).reset_index()
-    
-    # Print summary statistics
-    #print("\nSummary Statistics by Sub-experiment and Operation (in milliseconds):")
-    #print(summary_stats.to_string())
+        with open(log_file, "r") as f:
+            for line in f:
+                try:
+                    data = json.loads(line.strip())
+                    if "node" in data:
+                        rows.append({
+                            # 2025-01-19T14:51:47.895743172Z this is the format of the timestamp
+                            "timestamp": pd.to_datetime(data["timestamp"]),
+                            "node": data["node"],
+                            "cpu": data["cpu"],  # Milli CPU
+                            "memory": data["memory_bytes"],  # Memory in bytes
+                            "type": "node"
+                        })
+                    elif "namespace" in data:
+                        rows.append({
+                            "timestamp": pd.to_datetime(data["timestamp"]),
+                            "namespace": data["namespace"],
+                            "pod": data["pod"],
+                            "container": data["container"],
+                            "cpu": data["cpu"],  # Milli CPU
+                            "memory": data["memory_bytes"],  # Memory in bytes!!!!
+                            "type": "container"
+                        })
+                except json.JSONDecodeError:
+                    continue
+        self.metrics_df = pd.DataFrame(rows)
+        self.metrics_df["cpu_percentage"] = self.metrics_df["cpu"] / total_cpu * 100
+        self.metrics_df["memory_percentage"] = self.metrics_df["memory"] / total_memory * 100
+        return self.metrics_df
 
-    # format of the timestamps here: 2025-01-15 12:05:04.558628
-    print("Average duration of experiment runs per sub-experiment:")
-    # First group by sub_experiment_id and run_id to get duration per run
-    run_durations = df.groupby(['sub_experiment_id', 'run_id']).apply(
-        lambda x: (pd.to_datetime(x['loadgen_end_time']).max() - 
-                  pd.to_datetime(x['loadgen_start_time']).min()).total_seconds()
-    )
-    # Then calculate mean duration across runs for each sub-experiment
-    avg_duration_per_subexp = run_durations.groupby('sub_experiment_id').mean()
-    print("\nPer sub-experiment averages:")
-    for sub_exp, duration in avg_duration_per_subexp.items():
-        print(f"Sub-experiment {sub_exp}: {duration:.2f} seconds")
-    
-    print(f"\nOverall average: {avg_duration_per_subexp.mean():.2f} seconds")
-    
-    # Analyze impact on different services
-    service_impact = df.groupby(['service_name', 'delay_time'])['duration'].agg([
-        'mean', 'std', 'count'
-    ]).reset_index()
-    
-    print("\nImpact on Different Services (in milliseconds):")
-    print(service_impact.to_string())
+    def analyze(self):
+        """Perform analysis on the loaded data."""
+        if self.traces_df is None:
+            self.load_traces()
+        
+        # Convert duration to milliseconds
+        self.traces_df['duration'] = self.traces_df['duration'] / 1000
 
-    # Normalize time to be between 0 and 1 based on loadgen start/end times for each run
-    df['normalized_time'] = df.groupby(['sub_experiment_id', 'run_id']).apply(
-        lambda x: (x['start_time'] - x['start_time'].min()) / 
-                 (x['start_time'].max() - x['start_time'].min())
-    ).reset_index(level=[0,1], drop=True)
-    # Filter for the recommendation service
-    df_recommendation = df[df['service_name'] == 'recommendationservice']
-    g = sns.FacetGrid(df_recommendation, col="delay_time", row="delay_duration", height=4, aspect=1)
-    g.map(sns.scatterplot, data=df_recommendation, x="normalized_time", y="duration", hue="operation")
-    g.set(ylim=(0, 2000))
-    
-    plt.savefig('duration_analysis_facet.png')
+        # Convert loadgen_start_time and loadgen_end_time to datetime
+        self.traces_df['loadgen_start_time'] = pd.to_datetime(self.traces_df['loadgen_start_time'])
+        self.traces_df['loadgen_end_time'] = pd.to_datetime(self.traces_df['loadgen_end_time'])
+        
+        # Normalize time within each run
+        self.traces_df['normalized_time'] = self.traces_df.groupby(
+            ['sub_experiment_id', 'run_id'])['start_time'].transform(
+            lambda x: (x - x.min()) / (x.max() - x.min())
+        )
+        
+        # Generate basic statistics
+        self._generate_statistics()
+
+    def _analyze_packet_loss_variations(self):
+        """Analyze traces with packet loss treatment variations"""
+        # Traces under loss treatment have the value "loss_treatment" in the "loss_treatment" column
+        pass
+
+        
+        
+
+    def _generate_statistics(self):
+        """Generate and print various statistics about the experiment."""
+        # Basic duration statistics by service_name and treatment parameters
+        if self.service_filter:
+            stats = self.traces_df[self.traces_df['service_name'].isin(self.service_filter)].groupby(
+                ['service_name'] + list(self.params_mapping[0].keys()) + [self.treatment_type]
+            )['duration'].agg(['mean', 'std', 'count']).round(2)
+        else:
+            stats = self.traces_df.groupby(
+                ['service_name'] + list(self.params_mapping[0].keys()) + [self.treatment_type]
+            )['duration'].agg(['mean', 'std', 'count']).round(2)
+        
+        print("\nService Statistics:")
+        print(stats.to_string())
+
+    def _plot_latency_vs_time(self):
+        """Plot latency vs time"""
+        if self.service_filter:
+            traces_df = self.traces_df[self.traces_df['service_name'].isin(self.service_filter)]
+        else:
+            traces_df = self.traces_df
+
+        sns.lineplot(x='normalized_time', y='duration', hue=self.treatment_type, style="service_name", data=traces_df)
+        plt.title('Latency vs Time')
+        plt.xlabel('Normalized Time')
+        plt.ylabel('Latency (ms)')
+        plt.ylim(0, 1000)
+        plt.savefig(f'latency_vs_time_{self.treatment_type}.png')
+        plt.close()
+    def _plot_cpu_usage_over_time(self):
+        # Metric used is sum(rate(node_cpu_seconds_total{mode!=\"idle\"}[1m])) by (instance)
+        self.load_cpu_usage()
+        df = self.cpu_usage_df
+        
+        # Convert 'timestamp' to datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+
+        # Normalize time within each sub experiment
+        df['normalized_time'] = df.groupby(
+            ['sub_experiment_id', 'run_id'])['timestamp'].transform(
+            lambda x: (x - x.min()) / (x.max() - x.min())
+        )
+        
+        # Sort by timestamp
+        df = df.sort_values(by='timestamp')
+        
+        # Plotting
+        plt.figure(figsize=(12, 6))
+        sns.lineplot(data=df, x='normalized_time', y='cpu_usage', hue="sub_experiment_id")
+        plt.xlabel('Normalized Time')
+        plt.ylabel('CPU Usage')
+        plt.title('CPU Usage Over Time')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'cpu_usage_over_time_{self.treatment_type}.png')
+
+    def _plot_node_cpu_mem_over_time(self):
+        df = self.load_metrics_logs()
+        # Filter node metrics
+        node_metrics = df[df["type"] == "node"]
+
+        # Clear any existing plots
+        plt.clf()
+        # Plot CPU usage
+        plt.figure(figsize=(12, 6))
+        sns.lineplot(data=node_metrics, x="timestamp", y="cpu_percentage", hue="node")
+        plt.title("CPU Usage per Node (%)")
+        plt.ylabel("CPU Usage (%)")
+        plt.xlabel("Time")
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'node_cpu_usage_{self.treatment_type}.png')
+        plt.close()
+
+        # Clear any existing plots
+        plt.clf()
+        # Plot Memory usage
+        plt.figure(figsize=(12, 6))
+        sns.lineplot(data=node_metrics, x="timestamp", y="memory_percentage", hue="node")
+        plt.title("Memory Usage per Node (%)")
+        plt.ylabel("Memory Usage (%)")
+        plt.xlabel("Time")
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'node_memory_usage_{self.treatment_type}.png')
+        plt.close()
+
+    def _plot_namespace_cpu_mem_over_time(self):
+        df = self.load_metrics_logs()
+        # Filter container metrics
+        namespace_metrics = df[df["type"] == "container"]
+
+        # Aggregate by namespace and timestamp
+        namespace_agg = namespace_metrics.groupby(["timestamp", "namespace"]).sum().reset_index()
+
+        # Clear any existing plots
+        plt.clf()
+        # Plot CPU usage
+        plt.figure(figsize=(12, 6))
+        sns.lineplot(data=namespace_agg, x="timestamp", y="cpu_percentage", hue="namespace")
+        plt.title("CPU Usage per Namespace (%)")
+        plt.ylabel("CPU Usage (%)")
+        plt.xlabel("Time")
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'namespace_cpu_usage_{self.treatment_type}.png')
+        plt.close()
+
+        # Clear any existing plots
+        plt.clf()
+        # Plot Memory usage
+        plt.figure(figsize=(12, 6))
+        sns.lineplot(data=namespace_agg, x="timestamp", y="memory_percentage", hue="namespace")
+        plt.title("Memory Usage per Namespace (%)")
+        plt.ylabel("Memory Usage (%)")
+        plt.xlabel("Time")
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'namespace_memory_usage_{self.treatment_type}.png')
+        plt.close()
+
+    def _plot_trace_duration_by_service(self):
+        # Plot trace duration by service
+        sns.boxplot(x='service_name', y='duration', data=self.traces_df)
+        plt.title('Trace Duration by Service')
+        plt.xlabel('Service')
+        plt.ylabel('Duration (ms)')
+        plt.savefig(f'trace_duration_by_service_{self.treatment_type}.png')
+        plt.close()
 
 
-    # Lineplot of aggregated duration for recommendation service , considering treatment information.
-    # One line for NoTreatment, one line for delay_treatment.
+def main():
+    parser = argparse.ArgumentParser(description='Analyze experiment traces')
+    parser.add_argument('directory', help='Directory containing experiment files')
+    parser.add_argument('treatment_type', help='Type of treatment to analyze', choices=['loss_treatment', 'delay_treatment'])
+    args = parser.parse_args()
 
-    g2 = sns.FacetGrid(df_recommendation, col="delay_time", row="delay_duration", height=4, aspect=1)
-    g2.map(sns.lineplot, data=df_recommendation, x="normalized_time", y="duration", hue="delay_treatment")
-    g2.set(ylim=(0, 2000))
+    service_filter = ["recommendationservice", "frontend"]
 
-    plt.savefig('duration_analysis_facet_recommendation.png')
-
-    return df, configs
-
+    analyzer = ExperimentAnalyzer(args.directory, args.treatment_type, service_filter)
+    analyzer.analyze()
+    analyzer._plot_latency_vs_time()
+    analyzer._plot_cpu_usage_over_time()
+    analyzer._plot_node_cpu_mem_over_time()
+    analyzer._plot_namespace_cpu_mem_over_time()
+    analyzer._plot_trace_duration_by_service()
 if __name__ == "__main__":
-    df, configs = analyze_batch()
+    main()
