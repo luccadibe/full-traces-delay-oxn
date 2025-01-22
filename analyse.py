@@ -32,6 +32,7 @@ import seaborn as sns
 from pathlib import Path
 import argparse
 from typing import Dict, List, Any
+import numpy as np
 
 LOSS_TREATMENT_KEY = "loss_treatment"
 DELAY_TREATMENT_KEY = "delay_treatment"
@@ -55,7 +56,7 @@ class ExperimentAnalyzer:
         self.memory_usage = []
         self.memory_usage_df = None
         self.metrics_df = None
-
+        self.reports = None
     def _get_batch_id(self) -> str:
         """Extract batch ID from the first matching file in directory."""
         files = list(self.directory.glob("batch_*"))
@@ -82,7 +83,7 @@ class ExperimentAnalyzer:
     def load_traces(self) -> pd.DataFrame:
         """Load all trace files for the batch."""
         traces_data = []
-        trace_files = list(self.directory.glob(f"batch_{self.batch_id}_*_traces.json"))
+        trace_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_traces.json"))
         print(f"{len(trace_files)} trace files detected")
         for file_path in trace_files:
             # Extract sub_experiment_id and run_id from filename
@@ -121,11 +122,20 @@ class ExperimentAnalyzer:
         
         self.traces_df = pd.DataFrame(traces_data)
         return self.traces_df
-
+    def load_reports(self):
+        """Load all reports for the batch."""
+        reports = {}
+        report_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_report.yaml"))
+        for file_path in report_files:
+            sub_exp_id = int(file_path.stem.split('_')[2])
+            with open(file_path) as f:
+                reports[sub_exp_id] = json.load(f)
+        self.reports = reports
+        return self.reports
     def load_configs(self) -> Dict[int, Dict]:
         """Load all configuration files."""
         configs = {}
-        config_files = list(self.directory.glob(f"batch_{self.batch_id}_*_config.json"))
+        config_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_config.json"))
         
         for file_path in config_files:
             sub_exp_id = int(file_path.stem.split('_')[2])
@@ -237,9 +247,31 @@ class ExperimentAnalyzer:
         """Analyze traces with packet loss treatment variations"""
         # Traces under loss treatment have the value "loss_treatment" in the "loss_treatment" column
         pass
-
+    def analyze_loadgen_duration(self):
+        """Analyze the duration of the loadgen and compare with experiment timing"""
+        self.load_reports()
         
-        
+        for sub_exp_id, report in self.reports.items():
+            # Get experiment-level timing
+            exp_start = pd.to_datetime(report['report']['experiment_start'])
+            exp_end = pd.to_datetime(report['report']['experiment_end']) 
+            exp_duration = exp_end - exp_start
+            
+            print(f"\nSub Experiment {sub_exp_id}")
+            print(f"Total experiment duration: {exp_duration}")
+            print("Individual run durations:")
+            
+            for run_id, run_data in report['report']['runs'].items():
+                start_time = pd.to_datetime(run_data['loadgen']['loadgen_start_time'])
+                end_time = pd.to_datetime(run_data['loadgen']['loadgen_end_time'])
+                loadgen_duration = end_time - start_time
+                
+                # Calculate offset from experiment start
+                run_offset = start_time - exp_start
+                
+                print(f"  Run {run_id}:")
+                print(f"    Duration: {loadgen_duration}")
+                print(f"    Started at: {run_offset} from experiment start")
 
     def _generate_statistics(self):
         """Generate and print various statistics about the experiment."""
@@ -367,12 +399,501 @@ class ExperimentAnalyzer:
         plt.close()
 
     def _plot_trace_duration_by_service(self):
-        # Plot trace duration by service
-        sns.boxplot(x='service_name', y='duration', data=self.traces_df)
+        """Plot trace durations by service, processing one sub-experiment at a time."""
+        plt.figure(figsize=(15, 8))
+        
+        # Get all unique sub-experiment IDs
+        sub_exp_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_traces.json"))
+        sub_exp_ids = sorted(set(int(f.stem.split('_')[2]) for f in sub_exp_files))
+        
+        # Process each sub-experiment separately
+        for sub_exp_id in sub_exp_ids:
+            print(f"Processing sub-experiment {sub_exp_id}")
+            
+            # Load traces for just this sub-experiment
+            traces_data = []
+            trace_files = list(self.directory.glob(f"batch_{self.batch_id}_{sub_exp_id}_*_traces.json"))
+            
+            for file_path in trace_files:
+                run_id = int(file_path.stem.split('_')[3])
+                
+                with open(file_path) as f:
+                    traces = json.load(f)
+                    for trace in traces:
+                        # Only include necessary fields
+                        filtered_trace = {
+                            'duration': float(trace['duration']) / 1000,  # Convert to ms
+                            'start_time': float(trace['start_time']),
+                            'service_name': trace['service_name'],
+                            'sub_experiment_id': sub_exp_id,
+                            'run_id': run_id
+                        }
+                        
+                        # Add treatment parameters
+                        if sub_exp_id in self.params_mapping:
+                            for key, value in self.params_mapping[sub_exp_id].items():
+                                if key != 'sub_experiment_id':
+                                    filtered_trace[key] = value
+                        
+                        traces_data.append(filtered_trace)
+            
+            # Convert to DataFrame and process
+            sub_exp_df = pd.DataFrame(traces_data)
+            
+            # Filter services if needed
+            if self.service_filter:
+                sub_exp_df = sub_exp_df[sub_exp_df['service_name'].isin(self.service_filter)]
+            
+            # Normalize time within each run
+            sub_exp_df['normalized_time'] = sub_exp_df.groupby('run_id')['start_time'].transform(
+                lambda x: (x - x.min()) / (x.max() - x.min())
+            )
+            
+            # Plot this sub-experiment's data
+            for service in sub_exp_df['service_name'].unique():
+                service_data = sub_exp_df[sub_exp_df['service_name'] == service]
+                
+                # Calculate rolling mean for smoother lines
+                service_data = service_data.sort_values('normalized_time')
+                rolling_mean = service_data.groupby('service_name')['duration'].rolling(
+                    window=50, min_periods=1, center=True
+                ).mean().reset_index(level=0, drop=True)
+                
+                plt.plot(
+                    service_data['normalized_time'],
+                    rolling_mean,
+                    label=f"{service} (Sub-exp {sub_exp_id})",
+                    alpha=0.7
+                )
+            
+            # Clear memory
+            del traces_data
+            del sub_exp_df
+        
         plt.title('Trace Duration by Service')
-        plt.xlabel('Service')
+        plt.xlabel('Normalized Time')
         plt.ylabel('Duration (ms)')
-        plt.savefig(f'trace_duration_by_service_{self.treatment_type}.png')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        plt.savefig(f'trace_duration_by_service_{self.treatment_type}.png', bbox_inches='tight')
+        plt.close()
+
+    def _plot_treatment_comparison(self):
+        """Plot comparison between traces with and without treatment as a scatter plot."""
+        plt.figure(figsize=(15, 8))
+        
+        # Get all unique sub-experiment IDs
+        sub_exp_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_traces.json"))
+        sub_exp_ids = sorted(set(int(f.stem.split('_')[2]) for f in sub_exp_files))
+        
+        # Process each sub-experiment separately
+        for sub_exp_id in sub_exp_ids:
+            print(f"Processing sub-experiment {sub_exp_id}")
+            
+            # Load traces for just this sub-experiment
+            traces_data = []
+            trace_files = list(self.directory.glob(f"batch_{self.batch_id}_{sub_exp_id}_*_traces.json"))
+            
+            for file_path in trace_files:
+                run_id = int(file_path.stem.split('_')[3])
+                
+                with open(file_path) as f:
+                    traces = json.load(f)
+                    for trace in traces:
+                        # Only include necessary fields
+                        filtered_trace = {
+                            'duration': float(trace['duration']) / 1000,  # Convert to ms
+                            'start_time': float(trace['start_time']),
+                            'service_name': trace['service_name'],
+                            'treatment_status': 'With Treatment' if trace.get(self.treatment_type) == self.treatment_type else 'No Treatment',
+                            'sub_experiment_id': sub_exp_id,
+                            'run_id': run_id
+                        }
+                        
+                        # Add treatment parameters
+                        if sub_exp_id in self.params_mapping:
+                            for key, value in self.params_mapping[sub_exp_id].items():
+                                if key != 'sub_experiment_id':
+                                    filtered_trace[key] = value
+                        
+                        traces_data.append(filtered_trace)
+            
+            # Convert to DataFrame and process
+            sub_exp_df = pd.DataFrame(traces_data)
+            
+            # Filter services if needed
+            if self.service_filter:
+                sub_exp_df = sub_exp_df[sub_exp_df['service_name'].isin(self.service_filter)]
+            
+            # Normalize time within each run
+            sub_exp_df['normalized_time'] = sub_exp_df.groupby('run_id')['start_time'].transform(
+                lambda x: (x - x.min()) / (x.max() - x.min())
+            )
+            
+            # Plot this sub-experiment's data
+            for service in sub_exp_df['service_name'].unique():
+                for treatment in ['With Treatment', 'No Treatment']:
+                    mask = (sub_exp_df['service_name'] == service) & (sub_exp_df['treatment_status'] == treatment)
+                    service_data = sub_exp_df[mask]
+                    
+                    if not service_data.empty:
+                        marker = 'o' if treatment == 'With Treatment' else 'x'
+                        plt.scatter(
+                            service_data['normalized_time'],
+                            service_data['duration'],
+                            label=f"{service} ({treatment}) - Sub-exp {sub_exp_id}",
+                            marker=marker,
+                            alpha=0.3,
+                            s=20
+                        )
+            
+            # Clear memory
+            del traces_data
+            del sub_exp_df
+        
+        plt.title('Recommendationservice: Treatment vs No Treatment aggregated over all sub experiments')
+        plt.xlabel('Normalized Time')
+        plt.ylabel('Duration (ms)')
+        plt.legend(['Delay 120ms •', 'No Delay ×'], loc='upper right')
+        plt.tight_layout()
+        plt.savefig(f'treatment_comparison_{self.treatment_type}.png', bbox_inches='tight')
+        plt.close()
+
+    def _gather_fault_detection_data(self):
+        """Gather and process fault detection data into a DataFrame."""
+        detection_data = []
+        
+        for sub_exp_id in self.params_mapping.keys():
+            fault_file = self.directory / f"batch_{self.batch_id}_{sub_exp_id}_fault_detection.json"
+            if not fault_file.exists():
+                continue
+                
+            with open(fault_file) as f:
+                fault_data = json.load(f)
+                
+            # Find the relevant fault (matching treatment type)
+            relevant_faults = [
+                fault for fault in fault_data['results'] 
+                if fault['fault_name'] == self.treatment_type
+            ]
+            
+            if relevant_faults:
+                fault = relevant_faults[0]  # Take the first matching fault
+                params = self.params_mapping[sub_exp_id]
+                
+                detection_data.append({
+                    'sub_experiment_id': sub_exp_id,
+                    'detected': fault['detected'],
+                    'detection_latency': fault.get('detection_latency', None),
+                    'num_alerts': len(fault.get('alerts_triggered', [])),
+                    'latency_threshold': float(params['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']),
+                    'evaluation_window': int(params['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].replace('s', '')),
+                })
+        
+        return pd.DataFrame(detection_data)
+    
+    def _gather_raw_alerts_data(self):
+        """Gather and process raw fault detection data into a DataFrame."""
+        alerts_data = []
+        
+        # First load reports to get treatment timing information
+        reports = {}
+        for sub_exp_id in self.params_mapping.keys():
+            print(f"Processing sub-experiment {sub_exp_id}")
+            report_file = self.directory / f"batch_{self.batch_id}_{sub_exp_id}_report.yaml"
+            if report_file.exists():
+                print(f"Loading report file {report_file}")
+                with open(report_file) as f:
+                    report = json.load(f)
+                    # Find the relevant treatment timing
+                    for run_id, run_data in report['report']['runs'].items():
+                        for interaction in run_data['interactions'].values():
+                            # YOU NEED TO CHANGE THIS TO CHECK FOR THE CORRECT TREATMENT TYPE
+                            if interaction['treatment_type'] == "KubernetesNetworkDelayTreatment":
+                                print(f"Found treatment for sub-experiment {sub_exp_id}")
+                                reports[sub_exp_id] = {
+                                    'treatment_start': pd.to_datetime(interaction['treatment_start']),
+                                    'treatment_end': pd.to_datetime(interaction['treatment_end'])
+                                }
+                                break
+        # get and normalise the loadgen start and end times
+        # TODO
+        
+        # Now process alerts data
+        for sub_exp_id in self.params_mapping.keys():
+            detections_file = self.directory / f"batch_{self.batch_id}_{sub_exp_id}_detections.json"
+            if not detections_file.exists() or sub_exp_id not in reports:
+                continue
+                
+            with open(detections_file) as f:
+                detections = json.load(f)
+                
+            # Process each alert series
+            for result in detections['detections']['data']['result']:
+                metric = result['metric']
+                values = result['values']
+                
+                # Convert timestamps and values to DataFrame
+                alert_times = pd.DataFrame(values, columns=['timestamp', 'value'])
+                alert_times['timestamp'] = pd.to_datetime(alert_times['timestamp'], unit='s')
+                alert_times['value'] = alert_times['value'].astype(float)
+                
+                # Add metadata
+                alert_times['sub_experiment_id'] = sub_exp_id
+                alert_times['alertname'] = metric['alertname']
+                alert_times['service'] = metric.get('job', '').split('/')[-1]
+                alert_times['detection'] = metric.get('detection', '')
+                
+                # Classify alerts as true/false positives
+                """ treatment_period = (
+                    (alert_times['timestamp'] >= reports[sub_exp_id]['treatment_start']) &
+                    (alert_times['timestamp'] <= reports[sub_exp_id]['treatment_end'])
+                )
+                alert_times['alert_type'] = 'false_positive'
+                alert_times.loc[treatment_period, 'alert_type'] = 'true_positive'
+                
+                # Calculate detection time for first true positive
+                first_true_positive = alert_times[
+                    (alert_times['alert_type'] == 'true_positive') & 
+                    (alert_times['value'] == 1)
+                ]['timestamp'].min()
+                
+                if pd.notna(first_true_positive):
+                    detection_time = (
+                        first_true_positive - reports[sub_exp_id]['treatment_start']
+                    ).total_seconds()
+                else:
+                    detection_time = None
+                
+                alert_times['detection_time'] = detection_time """
+                
+                alerts_data.append(alert_times)
+        
+        if alerts_data:
+            return pd.concat(alerts_data, ignore_index=True)
+        return pd.DataFrame()
+
+    def _plot_fault_detection_latency_and_false_alerts(self):
+        """Plot detection latency and false alerts analysis."""
+        df = self._gather_raw_alerts_data()
+        if df.empty:
+            print("No alerts data available")
+            return
+            
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 12))
+        
+        # Plot 1: Detection Latency by Configuration
+        detection_stats = df.groupby('sub_experiment_id').agg({
+            'detection_time': 'first'  # Each sub-experiment has same detection time
+        }).reset_index()
+        
+        # Add configuration parameters
+        detection_stats['latency_threshold'] = detection_stats['sub_experiment_id'].map(
+            lambda x: self.params_mapping[x]['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']
+        )
+        detection_stats['evaluation_window'] = detection_stats['sub_experiment_id'].map(
+            lambda x: int(self.params_mapping[x]['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].replace('s', ''))
+        )
+        
+        sns.scatterplot(
+            data=detection_stats,
+            x='latency_threshold',
+            y='detection_time',
+            size='evaluation_window',
+            ax=ax1
+        )
+        ax1.set_title('Detection Latency by Configuration')
+        ax1.set_xlabel('Latency Threshold (ms)')
+        ax1.set_ylabel('Detection Time (seconds)')
+        
+        # Plot 2: False Positives by Configuration
+        false_positives = df[df['alert_type'] == 'false_positive'].groupby(
+            'sub_experiment_id'
+        ).size().reset_index(name='false_positive_count')
+        
+        # Add configuration parameters
+        false_positives['latency_threshold'] = false_positives['sub_experiment_id'].map(
+            lambda x: self.params_mapping[x]['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']
+        )
+        false_positives['evaluation_window'] = false_positives['sub_experiment_id'].map(
+            lambda x: int(self.params_mapping[x]['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].replace('s', ''))
+        )
+        
+        sns.scatterplot(
+            data=false_positives,
+            x='latency_threshold',
+            y='false_positive_count',
+            size='evaluation_window',
+            ax=ax2
+        )
+        ax2.set_title('False Positives by Configuration')
+        ax2.set_xlabel('Latency Threshold (ms)')
+        ax2.set_ylabel('Number of False Positives')
+        
+        plt.tight_layout()
+        plt.savefig(f'fault_detection_analysis_{self.treatment_type}.png', bbox_inches='tight', dpi=300)
+        plt.close()
+
+    def _plot_fault_detection_scatter(self):
+        """Create a scatter plot showing fault detection performance across parameter variations."""
+        plt.figure(figsize=(12, 8))
+        
+        # Get processed data
+        df = self._gather_fault_detection_data()
+        
+        # Create scatter plot
+        detected_mask = df['detected'] == True
+        not_detected_mask = df['detected'] == False
+        
+        # Plot points where faults were detected
+        plt.scatter(
+            df[detected_mask]['latency_threshold'],
+            df[detected_mask]['evaluation_window'],
+            s=df[detected_mask]['detection_latency'] / 10,  # Size based on detection latency
+            c='green',
+            alpha=0.6,
+            label='Detected',
+            marker='o'
+        )
+        
+        # Plot points where faults were not detected
+        plt.scatter(
+            df[not_detected_mask]['latency_threshold'],
+            df[not_detected_mask]['evaluation_window'],
+            c='red',
+            alpha=0.6,
+            label='Not Detected',
+            marker='x',
+            s=100  # Added size parameter to make points bigger
+        )
+        
+        # Add labels for each point
+        for _, row in df.iterrows():
+            label = f"Latency: {row['detection_latency']:.1f}s\nAlerts: {row['num_alerts']}"
+            plt.annotate(
+                label,
+                (row['latency_threshold'], row['evaluation_window']),
+                xytext=(5, 5),
+                textcoords='offset points',
+                fontsize=14
+            )
+        
+        plt.title(f'Fault Detection Performance by Parameter Variations\nTreatment: {self.treatment_type}')
+        plt.xlabel('Latency Threshold (ms)')
+        plt.ylabel('Evaluation Window (seconds)')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'fault_detection_scatter_{self.treatment_type}.png', bbox_inches='tight', dpi=300)
+        plt.close()
+
+    def _plot_alerts_over_traces(self):
+        """Plot trace durations as lines with alert firing times as points overlaid."""
+        plt.figure(figsize=(15, 8))
+        
+        # First get the alerts data
+        alerts_df = self._gather_raw_alerts_data()
+        if alerts_df.empty:
+            print("No alerts data available")
+            return
+            
+        # Process each sub-experiment separately
+        sub_exp_files = list(self.directory.glob(f"batch_{self.batch_id}_*_*_traces.json"))
+        sub_exp_ids = sorted(set(int(f.stem.split('_')[2]) for f in sub_exp_files))
+        
+        # Create a color map for sub-experiments
+        colors = plt.cm.rainbow(np.linspace(0, 1, len(sub_exp_ids)))
+        color_map = dict(zip(sub_exp_ids, colors))
+        
+        for sub_exp_id in sub_exp_ids:
+            print(f"Processing sub-experiment {sub_exp_id}")
+            
+            # Load traces for this sub-experiment
+            traces_data = []
+            trace_files = list(self.directory.glob(f"batch_{self.batch_id}_{sub_exp_id}_*_traces.json"))
+            
+            for file_path in trace_files:
+                run_id = int(file_path.stem.split('_')[3])
+                
+                with open(file_path) as f:
+                    traces = json.load(f)
+                    for trace in traces:
+                        filtered_trace = {
+                            'duration': float(trace['duration']) / 1000,  # Convert to ms
+                            'timestamp': pd.to_datetime(float(trace['start_time']), unit='us'),
+                            'service_name': trace['service_name'],
+                            'sub_experiment_id': sub_exp_id,
+                            'run_id': run_id
+                        }
+                        traces_data.append(filtered_trace)
+            
+            # Convert to DataFrame and process
+            sub_exp_df = pd.DataFrame(traces_data)
+            
+            # Filter services first
+            if self.service_filter:
+                sub_exp_df = sub_exp_df[sub_exp_df['service_name'].isin(self.service_filter)]
+            
+            if not sub_exp_df.empty:
+                # Normalize timestamps within each run
+                min_time = sub_exp_df['timestamp'].min()
+                max_time = sub_exp_df['timestamp'].max()
+                sub_exp_df['normalized_time'] = (sub_exp_df['timestamp'] - min_time) / (max_time - min_time)
+                
+                # Bin the data into 100 bins and calculate mean duration for each bin
+                bins = np.linspace(0, 1, 100)
+                binned_data = pd.cut(sub_exp_df['normalized_time'], bins, observed=True)
+                mean_durations = sub_exp_df.groupby(binned_data)['duration'].mean()
+                bin_centers = (bins[:-1] + bins[1:]) / 2
+                
+                # Plot smoothed trace durations
+                plt.plot(bin_centers,
+                        mean_durations,
+                        label=f'Traces Sub-exp {sub_exp_id}',
+                        color=color_map[sub_exp_id],
+                        alpha=0.7,
+                        linewidth=2)
+                
+                # Normalize and plot alert points for this sub-experiment
+                sub_exp_alerts = alerts_df[
+                    (alerts_df['sub_experiment_id'] == sub_exp_id) & 
+                    (alerts_df['value'] == 1)  # Only plot when alert is firing
+                ].copy()  # Create copy to avoid SettingWithCopyWarning
+                
+                if not sub_exp_alerts.empty:
+                    # Normalize alert timestamps
+                    sub_exp_alerts.loc[:, 'normalized_time'] = (
+                        sub_exp_alerts['timestamp'] - min_time) / (max_time - min_time)
+                    
+                    plt.scatter(sub_exp_alerts['normalized_time'],
+                              [mean_durations.max() * 1.1] * len(sub_exp_alerts),  # Position above the lines
+                              marker='v',
+                              color=color_map[sub_exp_id],
+                              s=100,
+                              label=f'Alerts Sub-exp {sub_exp_id}')
+            
+            # Clear memory
+            del traces_data
+            del sub_exp_df
+        
+        plt.title(f'Trace Durations with Alert Firing Times\nService: {", ".join(self.service_filter)}')
+        plt.xlabel('Normalized Time')
+        plt.ylabel('Duration (ms)')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # Add configuration details to plot
+        config_text = "Configurations:\n"
+        for sub_exp_id in sub_exp_ids:
+            params = self.params_mapping[sub_exp_id]
+            config_text += (f"Sub-exp {sub_exp_id}: "
+                          f"Threshold={params['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']}ms, "
+                          f"Window={params['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window']}\n")
+        
+        plt.figtext(0.02, 0.02, config_text, fontsize=8, va='bottom')
+        
+        plt.tight_layout()
+        plt.savefig(f'alerts_over_traces_{self.treatment_type}.png', bbox_inches='tight', dpi=300)
         plt.close()
 
 
@@ -382,14 +903,10 @@ def main():
     parser.add_argument('treatment_type', help='Type of treatment to analyze', choices=['loss_treatment', 'delay_treatment'])
     args = parser.parse_args()
 
-    service_filter = ["recommendationservice", "frontend"]
+    service_filter = ["recommendationservice"]
 
     analyzer = ExperimentAnalyzer(args.directory, args.treatment_type, service_filter)
-    analyzer.analyze()
-    analyzer._plot_latency_vs_time()
-    analyzer._plot_cpu_usage_over_time()
-    analyzer._plot_node_cpu_mem_over_time()
-    analyzer._plot_namespace_cpu_mem_over_time()
-    analyzer._plot_trace_duration_by_service()
+    #analyzer._plot_fault_detection_latency_and_false_alerts()
+    analyzer._plot_alerts_over_traces()
 if __name__ == "__main__":
     main()
