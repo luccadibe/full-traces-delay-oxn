@@ -20,7 +20,7 @@ class ExperimentAnalyzer:
     def __init__(self, directory: str, treatment_type: str, service_filter: List[str]):
         self.directory = Path(directory)
         self.batch_id = self._get_batch_id()
-        self.params_mapping = self._load_params_mapping()
+        self.params_mapping = self.load_params_mapping()
         self.traces_df = None
         self.configs = None
         self.treatment_type = treatment_type
@@ -32,6 +32,7 @@ class ExperimentAnalyzer:
         self.metrics_df = None
         self.reports = None
         self.alerts_df = None
+        self.fault_detection_df = None
     def _get_batch_id(self) -> str:
         """Extract batch ID from the first matching file in directory."""
         files = list(self.directory.glob("batch_*"))
@@ -42,7 +43,7 @@ class ExperimentAnalyzer:
         batch_id = files[0].name.split('_')[1]
         return batch_id
 
-    def _load_params_mapping(self) -> Dict[int, Dict[str, Any]]:
+    def load_params_mapping(self) -> Dict[int, Dict[str, Any]]:
         """Load the parameters to sub-experiment ID mapping."""
         params_file = self.directory / f"batch_{self.batch_id}_params_to_id.json"
         if not params_file.exists():
@@ -157,6 +158,52 @@ class ExperimentAnalyzer:
         self.alerts_df = self.alerts_df.drop('values', axis=1)
         return self.alerts_df
         
+    def load_fault_detection(self, fault_filter_out: List[str] = []):
+        """Load all fault detection files for the batch.
+        {
+            "results": [
+                {
+                    "fault_name": <fault_name>,
+                    "detected": <true/false>,
+                    "detection_time": "2025-01-29T20:17:54.655000",
+                    "detection_latency": 120.73843,
+                    "true_positives": [
+                        {
+                            "name": "CriticalServiceRPCLatencySpike",
+                            "time": "2025-01-29T20:18:09.655000",
+                            "severity": "critical",
+                            "labels": {"__name__": "ALERTS", "alertname": "CriticalServiceRPCLatencySpike", "alertstate": "firing", "detection": "rapid", "job": "opentelemetry-demo/adservice", "rpc_method": "GetAds", "rpc_service": "oteldemo.AdService", "runb...
+                        }
+                    ],
+                    "false_positives": [
+                        {
+                            "name": "CriticalServiceRPCLatencySpike",
+                            "time": "2025-01-29T20:18:09.655000",
+                            "severity": "critical",
+                            "labels": {"__name__": "ALERTS", "alertname": "CriticalServiceRPCLatencySpike", "alertstate": "firing", "detection": "rapid", "job": "opentelemetry-demo/adservice", "rpc_method": "GetAds", "rpc_service": "oteldemo.AdService", "runb...
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        """
+        fault_detection_files = list(self.directory.glob(f"batch_{self.batch_id}_*_fault_detection.json"))
+        print(f"{len(fault_detection_files)} fault detection files detected")
+        fault_detection_data = []
+        for file_path in fault_detection_files:
+            sub_exp_id = int(file_path.stem.split('_')[2])
+            with open(file_path) as f:
+                fault_detection = json.load(f)
+                for result in fault_detection["results"]:
+                    if result["fault_name"] not in fault_filter_out:
+                        result["sub_experiment_id"] = sub_exp_id
+                        if self.params_mapping is not None:
+                            result["params"] = self.params_mapping[sub_exp_id]
+                        fault_detection_data.append(result)
+        self.fault_detection_df = pd.DataFrame(fault_detection_data)
+        return self.fault_detection_df
+
     def load_reports(self):
         """Load all reports for the batch."""
         reports = {}
@@ -257,55 +304,124 @@ class ExperimentAnalyzer:
         self.metrics_df["memory_percentage"] = self.metrics_df["memory"] / total_memory * 100
         return self.metrics_df
 
-    def analyse_alerts(self):
+    def analyse_fault_detection(self, fault_filter_out: List[str] = []):
+        self.load_params_mapping()
+        self.load_fault_detection(fault_filter_out)
+        
+        # Print how many true positives and false positives per subexperiment
+        false_positives_total = 0
+        for sub_exp_id, group in self.fault_detection_df.groupby("sub_experiment_id"):
+            # Sum up all true positives and false positives across all fault detections
+            true_positives_count = sum(len(row.true_positives) for row in group.itertuples())
+            false_positives_count = sum(len(row.false_positives) for row in group.itertuples())
+           # Calculate actual false positives for this experiment by subtracting previous total
+            false_positives_real = false_positives_count - false_positives_total
+            false_positives_total += false_positives_real
+            print(f"Subexperiment {sub_exp_id} - Threshold: {self.params_mapping[sub_exp_id]['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']} - Evaluation Window: {self.params_mapping[sub_exp_id]['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window']}")
+            print(f"Detection latency: {group['detection_latency'].mean()}s")
+            print(f"True Positives: {true_positives_count}")
+            print(f"False Positives: {false_positives_real}")
 
-        self.load_traces()
-        print(f"Loaded {len(self.traces_df)} traces")
-        self.load_raw_alerts()
-        print(f"Loaded {len(self.alerts_df)} alerts")
-        self.load_reports()
-        print(f"Loaded {len(self.reports)} reports")
+    def plot_fault_detection_metrics(self):
+        """Create visualizations to analyze fault detection performance metrics."""
+        self.load_params_mapping()
+        self.load_fault_detection(fault_filter_out=["kubernetes_prometheus_rules", "add_security_context"])
+        
+        # Prepare data for plotting
+        plot_data = []
+        false_positives_total = 0
+        
+        for sub_exp_id, group in self.fault_detection_df.groupby("sub_experiment_id"):
+            true_positives_count = sum(len(row.true_positives) for row in group.itertuples())
+            false_positives_count = sum(len(row.false_positives) for row in group.itertuples())
+            false_positives_real = false_positives_count - false_positives_total
+            false_positives_total += false_positives_real
+            
+            params = self.params_mapping[sub_exp_id]
+            plot_data.append({
+                'sub_experiment_id': sub_exp_id,
+                'latency_threshold': float(params['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']),
+                'evaluation_window': float(params['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].rstrip('s')),
+                'detection_latency': group['detection_latency'].mean(),
+                'false_positives': false_positives_real,
+                'true_positives': true_positives_count
+            })
+        
+        df_plot = pd.DataFrame(plot_data)
+        
+        # Create a figure with multiple subplots
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. Heatmap showing detection latency vs threshold and window
+        pivot_latency = df_plot.pivot(
+            index='latency_threshold',
+            columns='evaluation_window',
+            values='detection_latency'
+        )
+        sns.heatmap(pivot_latency, annot=True, fmt='.1f', ax=ax1, cmap='YlOrRd')
+        ax1.set_title('Detection Latency (seconds)')
+        ax1.set_xlabel('Evaluation Window (seconds)')
+        ax1.set_ylabel('Latency Threshold (seconds)')
+        
+        # 2. Heatmap showing false positives vs threshold and window
+        pivot_fp = df_plot.pivot(
+        index='latency_threshold',
+        columns='evaluation_window',
+        values='false_positives'
+        )
+        sns.heatmap(pivot_fp, annot=True, fmt='.0f', ax=ax2, cmap='YlOrRd')  # Changed fmt='d' to fmt='.0f'
+        ax2.set_title('False Positives Count')
+        ax2.set_xlabel('Evaluation Window (seconds)')
+        ax2.set_ylabel('Latency Threshold (seconds)')
+        
+        # 3. Scatter plot with detection latency vs false positives
+        sns.scatterplot(
+            data=df_plot,
+            x='detection_latency',
+            y='false_positives',
+            size='evaluation_window',
+            hue='latency_threshold',
+            ax=ax3
+        )
+        ax3.set_title('Detection Latency vs False Positives')
+        ax3.set_xlabel('Detection Latency (seconds)')
+        ax3.set_ylabel('False Positives Count')
+        
+       # 4. Bar plot showing the truepositive/falsepositive ratio for different thresholds
+        thresholds = df_plot['latency_threshold'].unique()
+        ratios = []
+        for threshold in thresholds:
+            threshold_data = df_plot[df_plot['latency_threshold'] == threshold]
+            # Calculate average ratio for this threshold
+            ratio = threshold_data['true_positives'].sum() / threshold_data['false_positives'].sum()
+            ratios.append(ratio)
+        
+        # Create bar plot
+        ax4.bar(
+            thresholds,
+            ratios,
+            width=4, 
+            color='orange',
+            edgecolor='black'
+        )
+        
+        # Add value labels on top of each bar
+        for i, ratio in enumerate(ratios):
+            ax4.text(thresholds[i], ratio, f'{ratio:.2f}', 
+                    ha='center', va='bottom')
+            
+        ax4.set_title('True Positives/False Positives Ratio by Threshold')
+        ax4.set_xlabel('Latency Threshold (seconds)')
+        ax4.set_ylabel('True Positives/False Positives Ratio')
+        
+        # Add grid for better readability
+        ax4.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        plt.savefig('plots/fault_detection_analysis.png')
+        plt.close()
 
-        # Annotate the alerts with the treatment that was applied
-        self.alerts_df["treatment"] = "no_treatment"  # Default value
-        self.alerts_df["detection_latency"] = 0
-        for sub_exp_id, report in self.reports.items():
-            mask = self.alerts_df["sub_experiment_id"] == sub_exp_id
-            print(f"Found {mask.sum()} alerts for sub experiment {sub_exp_id}")
-            for run_id, run_data in report["report"]["runs"].items():
-                for interaction_id, interaction_data in run_data["interactions"].items():
-                    if interaction_data["treatment_name"] == self.treatment_type:
-                        # Convert treatment timestamps to datetime objects
-                        treatment_start = pd.to_datetime(interaction_data["treatment_start"])
-                        treatment_end = pd.to_datetime(interaction_data["treatment_end"])
-                        
-                        self.alerts_df.loc[mask, "treatment"] = self.alerts_df[mask]["timestamp"].apply(
-                            lambda x: "treatment" if treatment_start <= x <= treatment_end else "no_treatment"
-                        )
-                        self.alerts_df.loc[mask, "detection_latency"] = self.alerts_df[mask]["timestamp"] - treatment_start
-                        break
-                break
 
-        # Get the reference time (minimum from traces)
-        reference_time = self.traces_df["loadgen_start_time"].min()
-
-        # Normalise trace time
-        self.traces_df["normalized_time"] = self.traces_df["loadgen_start_time"] - reference_time
-
-        # Normalize alert times
-        self.alerts_df["normalized_time"] = self.alerts_df["timestamp"] - reference_time
-
-        print(f"Minimal detection latency: {self.alerts_df['detection_latency'].min()}")
-        print(f"Maximal detection latency: {self.alerts_df['detection_latency'].max()}")
-
-        # Plot the alerts over the traces
-        plt.figure(figsize=(10, 6))
-        sns.lineplot(x="normalized_time", y="detection_latency", data=self.alerts_df, hue="metric", style="metric", markers=True, dashes=False)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Alert Value")
-        plt.title("Alerts Over Traces")
-        plt.legend(title="Metric")
-        plt.savefig(f"{self.directory}/alerts_over_traces.png")
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze experiment traces')
@@ -317,6 +433,7 @@ def main():
 
     analyzer = ExperimentAnalyzer(args.directory, args.treatment_type, service_filter)
     #analyzer._plot_fault_detection_latency_and_false_alerts()
-    analyzer.analyse_alerts()
+    #analyzer.analyse_fault_detection(fault_filter_out=["kubernetes_prometheus_rules", "add_security_context"])
+    analyzer.plot_fault_detection_metrics()
 if __name__ == "__main__":
     main()
