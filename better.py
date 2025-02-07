@@ -33,6 +33,7 @@ class ExperimentAnalyzer:
         self.reports = None
         self.alerts_df = None
         self.fault_detection_df = None
+        self.plots_out_dir = None
     def _get_batch_id(self) -> str:
         """Extract batch ID from the first matching file in directory."""
         files = list(self.directory.glob("batch_*"))
@@ -79,6 +80,8 @@ class ExperimentAnalyzer:
             run_data = report_data['report']['runs'][actual_run_id]['loadgen']
             st_timestamp = pd.to_datetime(run_data.get('loadgen_start_time'))
             et_timestamp = pd.to_datetime(run_data.get('loadgen_end_time'))
+
+
             # Start loading traces
             with open(file_path) as f:
                 traces = json.load(f)
@@ -159,35 +162,7 @@ class ExperimentAnalyzer:
         return self.alerts_df
         
     def load_fault_detection(self, fault_filter_out: List[str] = []):
-        """Load all fault detection files for the batch.
-        {
-            "results": [
-                {
-                    "fault_name": <fault_name>,
-                    "detected": <true/false>,
-                    "detection_time": "2025-01-29T20:17:54.655000",
-                    "detection_latency": 120.73843,
-                    "true_positives": [
-                        {
-                            "name": "CriticalServiceRPCLatencySpike",
-                            "time": "2025-01-29T20:18:09.655000",
-                            "severity": "critical",
-                            "labels": {"__name__": "ALERTS", "alertname": "CriticalServiceRPCLatencySpike", "alertstate": "firing", "detection": "rapid", "job": "opentelemetry-demo/adservice", "rpc_method": "GetAds", "rpc_service": "oteldemo.AdService", "runb...
-                        }
-                    ],
-                    "false_positives": [
-                        {
-                            "name": "CriticalServiceRPCLatencySpike",
-                            "time": "2025-01-29T20:18:09.655000",
-                            "severity": "critical",
-                            "labels": {"__name__": "ALERTS", "alertname": "CriticalServiceRPCLatencySpike", "alertstate": "firing", "detection": "rapid", "job": "opentelemetry-demo/adservice", "rpc_method": "GetAds", "rpc_service": "oteldemo.AdService", "runb...
-                        }
-                    ]
-                }
-            ]
-        }
-        
-        """
+        """Load all fault detection files for the batch."""
         fault_detection_files = list(self.directory.glob(f"batch_{self.batch_id}_*_fault_detection.json"))
         print(f"{len(fault_detection_files)} fault detection files detected")
         fault_detection_data = []
@@ -195,14 +170,19 @@ class ExperimentAnalyzer:
             sub_exp_id = int(file_path.stem.split('_')[2])
             with open(file_path) as f:
                 fault_detection = json.load(f)
-                for result in fault_detection["results"]:
+                # Changed to handle fault_detection as a list directly
+                for result in fault_detection:  # Removed ["results"] access
                     if result["fault_name"] not in fault_filter_out:
                         result["sub_experiment_id"] = sub_exp_id
                         if self.params_mapping is not None:
                             result["params"] = self.params_mapping[sub_exp_id]
                         fault_detection_data.append(result)
         self.fault_detection_df = pd.DataFrame(fault_detection_data)
+        # turn the start_time and end_time into datetime
+        self.fault_detection_df['start_time'] = pd.to_datetime(self.fault_detection_df['start_time'])
+        self.fault_detection_df['end_time'] = pd.to_datetime(self.fault_detection_df['end_time'])
         return self.fault_detection_df
+
 
     def load_reports(self):
         """Load all reports for the batch."""
@@ -309,18 +289,48 @@ class ExperimentAnalyzer:
         self.load_fault_detection(fault_filter_out)
         
         # Print how many true positives and false positives per subexperiment
-        false_positives_total = 0
+        validation_issues = []
+        
         for sub_exp_id, group in self.fault_detection_df.groupby("sub_experiment_id"):
-            # Sum up all true positives and false positives across all fault detections
-            true_positives_count = sum(len(row.true_positives) for row in group.itertuples())
-            false_positives_count = sum(len(row.false_positives) for row in group.itertuples())
-           # Calculate actual false positives for this experiment by subtracting previous total
-            false_positives_real = false_positives_count - false_positives_total
-            false_positives_total += false_positives_real
-            print(f"Subexperiment {sub_exp_id} - Threshold: {self.params_mapping[sub_exp_id]['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']} - Evaluation Window: {self.params_mapping[sub_exp_id]['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window']}")
+            true_positives_count = 0
+            false_positives_count = 0
+            
+            for row in group.itertuples():
+                fault_start = row.start_time
+                fault_end = row.end_time
+                
+                # Validate true positives
+                for tp in row.true_positives:
+                    alert_time = pd.to_datetime(tp['time'])
+                    if not (fault_start <= alert_time <= fault_end):
+                        validation_issues.append(
+                            f"Sub-exp {sub_exp_id}: True positive alert at {alert_time} "
+                            f"outside fault interval [{fault_start}, {fault_end}]"
+                        )
+                true_positives_count += len(row.true_positives)
+                
+                # Validate false positives
+                for fp in row.false_positives:
+                    alert_time = pd.to_datetime(fp['time'])
+                    if fault_start <= alert_time <= fault_end:
+                        validation_issues.append(
+                            f"Sub-exp {sub_exp_id}: False positive alert at {alert_time} "
+                            f"inside fault interval [{fault_start}, {fault_end}]"
+                        )
+                false_positives_count += len(row.false_positives)
+            
+            print(f"\nSubexperiment {sub_exp_id} - Threshold: {self.params_mapping[sub_exp_id]['treatments.0.kubernetes_prometheus_rules.params.latency_threshold']} - Evaluation Window: {self.params_mapping[sub_exp_id]['treatments.0.kubernetes_prometheus_rules.params.evaluation_window']}")
             print(f"Detection latency: {group['detection_latency'].mean()}s")
             print(f"True Positives: {true_positives_count}")
-            print(f"False Positives: {false_positives_real}")
+            print(f"False Positives: {false_positives_count}")
+    
+        # Print validation issues if any were found
+        if validation_issues:
+            print("\nValidation Issues Found:")
+            for issue in validation_issues:
+                print(f"- {issue}")
+        else:
+            print("\nNo validation issues found - all alerts are correctly categorized!")
 
     def plot_fault_detection_metrics(self):
         """Create visualizations to analyze fault detection performance metrics."""
@@ -329,21 +339,19 @@ class ExperimentAnalyzer:
         
         # Prepare data for plotting
         plot_data = []
-        false_positives_total = 0
         
         for sub_exp_id, group in self.fault_detection_df.groupby("sub_experiment_id"):
             true_positives_count = sum(len(row.true_positives) for row in group.itertuples())
             false_positives_count = sum(len(row.false_positives) for row in group.itertuples())
-            false_positives_real = false_positives_count - false_positives_total
-            false_positives_total += false_positives_real
             
             params = self.params_mapping[sub_exp_id]
             plot_data.append({
                 'sub_experiment_id': sub_exp_id,
-                'latency_threshold': float(params['experiment.treatments.0.kubernetes_prometheus_rules.params.latency_threshold']),
-                'evaluation_window': float(params['experiment.treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].rstrip('s')),
+                'latency_threshold': float(params['treatments.0.kubernetes_prometheus_rules.params.latency_threshold']),
+                'evaluation_window': float(params['treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].rstrip('s')),
                 'detection_latency': group['detection_latency'].mean(),
-                'false_positives': false_positives_real,
+                'false_positives': false_positives_count,
+
                 'true_positives': true_positives_count
             })
         
@@ -418,9 +426,57 @@ class ExperimentAnalyzer:
         ax4.grid(axis='y', linestyle='--', alpha=0.7)
         
         plt.tight_layout()
-        plt.savefig('plots/fault_detection_analysis.png')
+        plt.savefig(f'{self.plots_out_dir}/fault_detection_analysis.png')
         plt.close()
 
+    def plot_trace_duration_by_service(self, service_filter=None):
+        """Plot trace durations by service, aggregating across all sub-experiments.
+        
+        Args:
+            service_filter (list): Optional list of service names to filter by
+        """
+        plt.figure(figsize=(15, 8))
+        df = self.load_traces()
+        reports_df = self.reports
+
+        # Filter services if specified
+        if service_filter:
+            df = df[df['service_name'].isin(service_filter)]
+        
+        # Normalize time across all sub experiments
+        df['normalized_time'] = df.groupby('sub_experiment_id')['start_time'].transform(
+        lambda x: (x - x.min()) / (x.max() - x.min())
+    )
+        
+        # Convert duration from microseconds to milliseconds
+        df['duration'] = df['duration'] / 1000
+
+        # Plot data for each service
+        for service in df['service_name'].unique():
+
+            service_data = df[df['service_name'] == service]
+            
+            # Calculate rolling mean for smoother lines
+            service_data = service_data.sort_values('normalized_time')
+            rolling_mean = service_data.groupby('service_name')['duration'].rolling(
+                window=100, min_periods=1, center=True
+            ).mean().reset_index(level=0, drop=True)
+            
+            sns.lineplot(
+                data=service_data,
+                x='normalized_time',
+                y='duration',
+                hue='delay_treatment',
+                alpha=0.7
+            )
+        
+        plt.title('Trace Duration by Service')
+        plt.xlabel('Normalized Time')
+        plt.ylabel('Duration (ms)')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        plt.savefig(f'{self.plots_out_dir}/trace_duration_by_service_{self.treatment_type}.png', bbox_inches='tight')
+        plt.close()
 
 
 def main():
@@ -432,8 +488,13 @@ def main():
     service_filter = ["recommendationservice"]
 
     analyzer = ExperimentAnalyzer(args.directory, args.treatment_type, service_filter)
+    analyzer.plots_out_dir = args.directory + "/plots"
+    # Create plots directory if it doesn't exist
+    Path(analyzer.plots_out_dir).mkdir(parents=True, exist_ok=True)
     #analyzer._plot_fault_detection_latency_and_false_alerts()
     #analyzer.analyse_fault_detection(fault_filter_out=["kubernetes_prometheus_rules", "add_security_context"])
+    analyzer.analyse_fault_detection(fault_filter_out=["kubernetes_prometheus_rules", "add_security_context"])
     analyzer.plot_fault_detection_metrics()
+    analyzer.plot_trace_duration_by_service(service_filter=service_filter)
 if __name__ == "__main__":
     main()
