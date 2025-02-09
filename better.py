@@ -478,12 +478,66 @@ class ExperimentAnalyzer:
         plt.savefig(f'{self.plots_out_dir}/trace_duration_by_service_{self.treatment_type}.png', bbox_inches='tight')
         plt.close()
 
-
+    def analyse_raw_alerts(self):
+        """Analyse the raw alerts and verify if they triggered during fault injection periods."""
+        self.load_raw_alerts()
+        self.load_fault_detection()
+        
+        # Group alerts by sub_experiment_id
+        for sub_exp_id, alerts_group in self.alerts_df.groupby('sub_experiment_id'):
+            print(f"\nAnalyzing alerts for sub-experiment {sub_exp_id}")
+            
+            # Get fault injection periods for this sub-experiment
+            fault_periods = self.fault_detection_df[
+                self.fault_detection_df['sub_experiment_id'] == sub_exp_id
+            ]
+            
+            if fault_periods.empty:
+                print(f"No fault periods found for sub-experiment {sub_exp_id}")
+                continue
+            
+            total_alerts = len(alerts_group)
+            alerts_during_faults = 0
+            alerts_outside_faults = 0
+            
+            # Analyze each alert
+            for _, alert in alerts_group.iterrows():
+                alert_time = alert['timestamp']
+                alert_in_fault_period = False
+                
+                # Check if alert falls within any fault period
+                for _, fault in fault_periods.iterrows():
+                    if fault['start_time'] <= alert_time <= fault['end_time']:
+                        alert_in_fault_period = True
+                        alerts_during_faults += 1
+                        break
+                
+                if not alert_in_fault_period:
+                    alerts_outside_faults += 1
+            
+            # Print statistics
+            print(f"Total alerts: {total_alerts}")
+            print(f"Alerts during fault injection: {alerts_during_faults}")
+            print(f"Alerts outside fault injection: {alerts_outside_faults}")
+            
+            if total_alerts > 0:
+                during_percentage = (alerts_during_faults / total_alerts) * 100
+                outside_percentage = (alerts_outside_faults / total_alerts) * 100
+                print(f"Percentage during faults: {during_percentage:.2f}%")
+                print(f"Percentage outside faults: {outside_percentage:.2f}%")
+                
+                # Get experiment parameters if available
+                if self.params_mapping and sub_exp_id in self.params_mapping:
+                    params = self.params_mapping[sub_exp_id]
+                    print("\nExperiment parameters:")
+                    print(f"Latency threshold: {params.get('treatments.0.kubernetes_prometheus_rules.params.latency_threshold', 'N/A')}")
+                    print(f"Evaluation window: {params.get('treatments.0.kubernetes_prometheus_rules.params.evaluation_window', 'N/A')}")
 def main():
     parser = argparse.ArgumentParser(description='Analyze experiment traces')
     parser.add_argument('directory', help='Directory containing experiment files')
     parser.add_argument('treatment_type', help='Type of treatment to analyze', choices=['loss_treatment', 'delay_treatment'])
     args = parser.parse_args()
+
 
     service_filter = ["recommendationservice"]
 
@@ -496,5 +550,6 @@ def main():
     analyzer.analyse_fault_detection(fault_filter_out=["kubernetes_prometheus_rules", "add_security_context"])
     analyzer.plot_fault_detection_metrics()
     analyzer.plot_trace_duration_by_service(service_filter=service_filter)
+    analyzer.analyse_raw_alerts()
 if __name__ == "__main__":
     main()
