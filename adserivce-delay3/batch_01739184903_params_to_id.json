@@ -1,0 +1,1 @@
+[{"sub_experiment_id": 0, "treatments.0.kubernetes_prometheus_rules.params.latency_threshold": 100.0, "treatments.0.kubernetes_prometheus_rules.params.evaluation_window": "120s"}, {"sub_experiment_id": 1, "treatments.0.kubernetes_prometheus_rules.params.latency_threshold": 300.0, "treatments.0.kubernetes_prometheus_rules.params.evaluation_window": "120s"}]

@@ -132,7 +132,6 @@ class ExperimentAnalyzer:
                         ]
                     ]
                 }
-                ]
                 }
                 }
             }
@@ -466,7 +465,7 @@ class ExperimentAnalyzer:
                 data=service_data,
                 x='normalized_time',
                 y='duration',
-                hue='delay_treatment',
+                hue=self.treatment_type,
                 alpha=0.7
             )
         
@@ -482,6 +481,8 @@ class ExperimentAnalyzer:
         """Analyse the raw alerts and verify if they triggered during fault injection periods."""
         self.load_raw_alerts()
         self.load_fault_detection()
+
+        all_alerts = []
         
         # Group alerts by sub_experiment_id
         for sub_exp_id, alerts_group in self.alerts_df.groupby('sub_experiment_id'):
@@ -502,7 +503,17 @@ class ExperimentAnalyzer:
             
             # Analyze each alert
             for _, alert in alerts_group.iterrows():
-                alert_time = alert['timestamp']
+                # Extract metric information
+                metric = alert['metric']
+                all_alerts.append({
+                    'timestamp': alert['timestamp'],
+                    'sub_experiment_id': alert['sub_experiment_id'],
+                    'alert_name': metric['alertname'],
+                    'alert_state': metric['alertstate'],
+                    'value': alert['value']
+                })
+                
+                alert_time = alert['timestamp'].tz_localize('UTC')
                 alert_in_fault_period = False
                 
                 # Check if alert falls within any fault period
@@ -532,14 +543,80 @@ class ExperimentAnalyzer:
                     print("\nExperiment parameters:")
                     print(f"Latency threshold: {params.get('treatments.0.kubernetes_prometheus_rules.params.latency_threshold', 'N/A')}")
                     print(f"Evaluation window: {params.get('treatments.0.kubernetes_prometheus_rules.params.evaluation_window', 'N/A')}")
+
+        # Convert all_alerts to DataFrame for plotting
+        alerts_df = pd.DataFrame(all_alerts)
+        
+        # Only plot alerts that are firing (value == 1)
+        firing_alerts = alerts_df[alerts_df['value'] == '1']
+
+        # Analyse how many times per second each alert fires
+        alert_rates = []
+        for sub_exp_id, sub_exp_alerts in firing_alerts.groupby('sub_experiment_id'):
+            # Get experiment parameters for context
+            params = self.params_mapping[sub_exp_id]
+            latency_threshold = params.get('treatments.0.kubernetes_prometheus_rules.params.latency_threshold', 'N/A')
+            evaluation_window = params.get('treatments.0.kubernetes_prometheus_rules.params.evaluation_window', 'N/A')
+            
+            # Calculate time range for this sub-experiment
+            time_range = (sub_exp_alerts['timestamp'].max() - sub_exp_alerts['timestamp'].min()).total_seconds()
+            
+            # Group by alert name and calculate rates
+            for alert_name, alert_group in sub_exp_alerts.groupby('alert_name'):
+                total_alerts = len(alert_group)
+                rate = total_alerts / time_range if time_range > 0 else 0
+                
+                alert_rates.append({
+                    'sub_experiment_id': sub_exp_id,
+                    'alert_name': alert_name,
+                    'total_alerts': total_alerts,
+                    'time_range_seconds': time_range,
+                    'alerts_per_second': rate,
+                    'latency_threshold': latency_threshold,
+                    'evaluation_window': evaluation_window
+                })
+        
+        # Convert to DataFrame for analysis and plotting
+        rates_df = pd.DataFrame(alert_rates)
+        
+        # Print summary statistics
+        print("\nAlert Firing Rates Summary:")
+        for sub_exp_id, group in rates_df.groupby('sub_experiment_id'):
+            print(f"\nSub-experiment {sub_exp_id}:")
+            print(f"Latency Threshold: {group['latency_threshold'].iloc[0]}")
+            print(f"Evaluation Window: {group['evaluation_window'].iloc[0]}")
+            print("\nAlert firing rates (alerts/second):")
+            for _, row in group.iterrows():
+                print(f"{row['alert_name']}: {row['alerts_per_second']:.3f} "
+                      f"(Total: {row['total_alerts']} over {row['time_range_seconds']:.1f}s)")
+        
+        # plot the alerts during faults and outside faults
+        plt.figure(figsize=(15, 8))
+        sns.scatterplot(
+            data=firing_alerts,
+            x='timestamp',
+            y='sub_experiment_id',
+            hue='alert_state',
+            style='alert_name',
+            s=100
+        )
+        plt.title('Alert Firing Times by Sub-experiment')
+        plt.xlabel('Time')
+        plt.ylabel('Sub-experiment ID')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f'{self.plots_out_dir}/alerts_during_faults_and_outside_faults.png')
+        plt.close()
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze experiment traces')
     parser.add_argument('directory', help='Directory containing experiment files')
-    parser.add_argument('treatment_type', help='Type of treatment to analyze', choices=['loss_treatment', 'delay_treatment'])
+    parser.add_argument('treatment_type', help='Type of treatment to analyze', choices=['packet_loss_treatment', 'delay_treatment'])
     args = parser.parse_args()
 
 
-    service_filter = ["recommendationservice"]
+
+    service_filter = ["adservice"]
 
     analyzer = ExperimentAnalyzer(args.directory, args.treatment_type, service_filter)
     analyzer.plots_out_dir = args.directory + "/plots"
