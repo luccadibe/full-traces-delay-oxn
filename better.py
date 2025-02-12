@@ -11,6 +11,7 @@ import numpy as np
 LOSS_TREATMENT_KEY = "loss_treatment"
 DELAY_TREATMENT_KEY = "delay_treatment"
 EXPERIMENT_METRICS_LOG = "delay-19/delay-metrics.log"
+ALERTS_FILTER_OUT = ["ImmediateHighHTTPLatency"]
 
 # Total cluster resources (replace with actual values)
 total_cpu = 12000  # Milli CPU - 3 x e2-standard-4
@@ -175,6 +176,9 @@ class ExperimentAnalyzer:
                         result["sub_experiment_id"] = sub_exp_id
                         if self.params_mapping is not None:
                             result["params"] = self.params_mapping[sub_exp_id]
+                        # filter out the alerts that are in the ALERTS_FILTER_OUT list
+                        result["true_positives"] = [tp for tp in result["true_positives"] if tp["name"] not in ALERTS_FILTER_OUT]
+                        result["false_positives"] = [fp for fp in result["false_positives"] if fp["name"] not in ALERTS_FILTER_OUT]
                         fault_detection_data.append(result)
         self.fault_detection_df = pd.DataFrame(fault_detection_data)
         # turn the start_time and end_time into datetime
@@ -300,6 +304,8 @@ class ExperimentAnalyzer:
                 
                 # Validate true positives
                 for tp in row.true_positives:
+                    if tp['name'] in ALERTS_FILTER_OUT:
+                        continue
                     alert_time = pd.to_datetime(tp['time'])
                     if not (fault_start <= alert_time <= fault_end):
                         validation_issues.append(
@@ -310,6 +316,8 @@ class ExperimentAnalyzer:
                 
                 # Validate false positives
                 for fp in row.false_positives:
+                    if fp['name'] in ALERTS_FILTER_OUT:
+                        continue
                     alert_time = pd.to_datetime(fp['time'])
                     if fault_start <= alert_time <= fault_end:
                         validation_issues.append(
@@ -331,6 +339,8 @@ class ExperimentAnalyzer:
         else:
             print("\nNo validation issues found - all alerts are correctly categorized!")
 
+        #self.plot_traces_with_fault_detection(self.load_traces(), 4)
+
     def plot_fault_detection_metrics(self):
         """Create visualizations to analyze fault detection performance metrics."""
         self.load_params_mapping()
@@ -339,18 +349,47 @@ class ExperimentAnalyzer:
         # Prepare data for plotting
         plot_data = []
         
+        # Group by sub_experiment_id. For each sub-experiment, sort the faults by start time,
+        # then filter out false positives that fall within any earlier true-positive interval.
         for sub_exp_id, group in self.fault_detection_df.groupby("sub_experiment_id"):
-            true_positives_count = sum(len(row.true_positives) for row in group.itertuples())
-            false_positives_count = sum(len(row.false_positives) for row in group.itertuples())
+            # Sort faults by start_time so we can properly exclude FP alerts already covered by previous faults.
+            sorted_group = group.sort_values("start_time")
+            true_positives_count = 0
+            false_positives_count = 0
+            previous_intervals = []  # List to store intervals (start_time, end_time) for faults with true positives.
+
+            for row in sorted_group.itertuples():
+                # Count true positives normally.
+                tp_list = row.true_positives if row.true_positives is not None else []
+                tp_count = len(tp_list)
+                true_positives_count += tp_count
+
+                # Process false positives: filter out alerts that fall in any previously recorded true positive fault interval.
+                fp_list = row.false_positives if row.false_positives is not None else []
+                fp_filtered = []
+                for fp in fp_list:
+                    alert_time = pd.to_datetime(fp['time'])
+                    # If alert time is within any previously added fault interval, do not count it as a false positive.
+                    if any(start <= alert_time <= end for (start, end) in previous_intervals):
+                        continue
+                    fp_filtered.append(fp)
+                false_positives_count += len(fp_filtered)
+
+                # If this fault record contained any true positives, record its interval so that later FPs can be filtered.
+                if tp_count > 0:
+                    fault_start = pd.to_datetime(row.start_time)
+                    fault_end = pd.to_datetime(row.end_time)
+                    previous_intervals.append((fault_start, fault_end))
             
+            # Use experiment parameters from the params mapping for details.
             params = self.params_mapping[sub_exp_id]
             plot_data.append({
                 'sub_experiment_id': sub_exp_id,
                 'latency_threshold': float(params['treatments.0.kubernetes_prometheus_rules.params.latency_threshold']),
                 'evaluation_window': float(params['treatments.0.kubernetes_prometheus_rules.params.evaluation_window'].rstrip('s')),
+                'quantile': float(params['treatments.0.kubernetes_prometheus_rules.params.quantile']),
                 'detection_latency': group['detection_latency'].mean(),
                 'false_positives': false_positives_count,
-
                 'true_positives': true_positives_count
             })
         
@@ -359,34 +398,34 @@ class ExperimentAnalyzer:
         # Create a figure with multiple subplots
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
         
-        # 1. Heatmap showing detection latency vs threshold and window
+        # 1. Heatmap showing detection latency vs threshold and quantile.
         pivot_latency = df_plot.pivot(
             index='latency_threshold',
-            columns='evaluation_window',
+            columns='quantile',
             values='detection_latency'
         )
         sns.heatmap(pivot_latency, annot=True, fmt='.1f', ax=ax1, cmap='YlOrRd')
         ax1.set_title('Detection Latency (seconds)')
-        ax1.set_xlabel('Evaluation Window (seconds)')
+        ax1.set_xlabel('Quantile')
         ax1.set_ylabel('Latency Threshold (seconds)')
         
-        # 2. Heatmap showing false positives vs threshold and window
+        # 2. Heatmap showing false positives vs threshold and quantile.
         pivot_fp = df_plot.pivot(
-        index='latency_threshold',
-        columns='evaluation_window',
-        values='false_positives'
+            index='latency_threshold',
+            columns='quantile',
+            values='false_positives'
         )
-        sns.heatmap(pivot_fp, annot=True, fmt='.0f', ax=ax2, cmap='YlOrRd')  # Changed fmt='d' to fmt='.0f'
+        sns.heatmap(pivot_fp, annot=True, fmt='.0f', ax=ax2, cmap='YlOrRd')
         ax2.set_title('False Positives Count')
-        ax2.set_xlabel('Evaluation Window (seconds)')
+        ax2.set_xlabel('Quantile')
         ax2.set_ylabel('Latency Threshold (seconds)')
         
-        # 3. Scatter plot with detection latency vs false positives
+        # 3. Scatter plot with detection latency vs false positives.
         sns.scatterplot(
             data=df_plot,
             x='detection_latency',
             y='false_positives',
-            size='evaluation_window',
+            size='quantile',
             hue='latency_threshold',
             ax=ax3
         )
@@ -394,35 +433,39 @@ class ExperimentAnalyzer:
         ax3.set_xlabel('Detection Latency (seconds)')
         ax3.set_ylabel('False Positives Count')
         
-       # 4. Bar plot showing the truepositive/falsepositive ratio for different thresholds
+        # 4. Bar plot showing true positives and false positives.
+        sns.set_theme(style="whitegrid")
+        bar_plot_data = []
         thresholds = df_plot['latency_threshold'].unique()
-        ratios = []
         for threshold in thresholds:
             threshold_data = df_plot[df_plot['latency_threshold'] == threshold]
-            # Calculate average ratio for this threshold
-            ratio = threshold_data['true_positives'].sum() / threshold_data['false_positives'].sum()
-            ratios.append(ratio)
+            bar_plot_data.append({
+                'threshold': threshold,
+                'true_positives': threshold_data['true_positives'].sum(),
+                'false_positives': threshold_data['false_positives'].sum()
+            })
+        plot_df = pd.DataFrame(bar_plot_data)
         
-        # Create bar plot
-        ax4.bar(
-            thresholds,
-            ratios,
-            width=4, 
-            color='orange',
-            edgecolor='black'
-        )
+        if plot_df['true_positives'].sum() < plot_df['false_positives'].sum():
+            sns.set_color_codes("muted")
+            sns.barplot(x="false_positives", y="threshold", data=plot_df,
+                        label="False Positives", color="red", ax=ax4, orient="h")
         
-        # Add value labels on top of each bar
-        for i, ratio in enumerate(ratios):
-            ax4.text(thresholds[i], ratio, f'{ratio:.2f}', 
-                    ha='center', va='bottom')
-            
-        ax4.set_title('True Positives/False Positives Ratio by Threshold')
-        ax4.set_xlabel('Latency Threshold (seconds)')
-        ax4.set_ylabel('True Positives/False Positives Ratio')
+            sns.set_color_codes("pastel")
+            sns.barplot(x="true_positives", y="threshold", data=plot_df,
+                        label="True Positives", color="green", ax=ax4, orient="h")
+        else:
+            sns.set_color_codes("pastel")
+            sns.barplot(x="true_positives", y="threshold", data=plot_df,
+                        label="True Positives", color="green", ax=ax4, orient="h")
+            sns.set_color_codes("muted")
+            sns.barplot(x="false_positives", y="threshold", data=plot_df,
+                        label="False Positives", color="red", ax=ax4, orient="h")
         
-        # Add grid for better readability
-        ax4.grid(axis='y', linestyle='--', alpha=0.7)
+        ax4.legend(ncol=2, loc="lower right", frameon=True)
+        ax4.set(ylabel="Latency Threshold (seconds)", xlabel="Number of Alerts")
+        ax4.set_title('True vs False Positives by Threshold')
+        sns.despine(left=True, bottom=True, ax=ax4)
         
         plt.tight_layout()
         plt.savefig(f'{self.plots_out_dir}/fault_detection_analysis.png')
@@ -443,9 +486,10 @@ class ExperimentAnalyzer:
             df = df[df['service_name'].isin(service_filter)]
         
         # Normalize time across all sub experiments
-        df['normalized_time'] = df.groupby('sub_experiment_id')['start_time'].transform(
-        lambda x: (x - x.min()) / (x.max() - x.min())
-    )
+        #df['normalized_time'] = df.groupby('sub_experiment_id')['start_time'].transform(
+        #    lambda x: (x - x.min()) / (x.max() - x.min())
+        #)
+        df['normalized_time'] = df['start_time']
         
         # Convert duration from microseconds to milliseconds
         df['duration'] = df['duration'] / 1000
@@ -470,12 +514,120 @@ class ExperimentAnalyzer:
             )
         
         plt.title('Trace Duration by Service')
-        plt.xlabel('Normalized Time')
+        plt.xlabel('Timestamps')
         plt.ylabel('Duration (ms)')
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
         plt.savefig(f'{self.plots_out_dir}/trace_duration_by_service_{self.treatment_type}.png', bbox_inches='tight')
         plt.close()
+
+    def plot_traces_with_fault_detection(self, df, sub_exp_id):
+        """Plot traces with fault detection for a single sub-experiment.
+
+        This plot is similar to the one generated in plot_trace_duration_by_service but overlays vertical dashed lines
+        at the fault start and end times indicated by the fault detection data (i.e. where alerts were triggered).
+        
+        Args:
+            df (pd.DataFrame): The traces DataFrame.
+            sub_exp_id (int): The sub-experiment ID for which to plot the traces.
+        """
+        # Filter traces for the provided sub_experiment_id
+        df_sub = df[df['sub_experiment_id'] == sub_exp_id].copy()
+        if df_sub.empty:
+            print(f"No traces found for sub-experiment {sub_exp_id}.")
+            return
+
+        # Ensure start_time column is datetime
+        if not pd.api.types.is_datetime64_any_dtype(df_sub['start_time']):
+            # Convert microseconds since epoch to datetime
+            df_sub['start_time'] = pd.to_datetime(df_sub['start_time'], unit='us')
+        
+        df_sub['normalized_time'] = df_sub['start_time']
+
+        # Convert duration from microseconds to milliseconds
+        df_sub['duration'] = df_sub['duration'] / 1000
+
+        plt.figure(figsize=(15, 8))
+        services = ["recommendationservice"]
+        # Plot line for each service in the sub-experiment
+        for service in df_sub['service_name'].unique():
+            if service not in services:
+                continue
+            service_data = df_sub[df_sub['service_name'] == service].sort_values('normalized_time')
+            sns.lineplot(
+                data=service_data,
+                x='normalized_time',
+                y='duration',
+                label=service,
+                alpha=0.7
+            )
+
+        plt.title(f"Trace Duration with Fault Detection for Sub-experiment {sub_exp_id}")
+        plt.xlabel("Timestamps")
+        plt.ylabel("Duration (ms)")
+        
+        # Load fault detection data if not already loaded
+        if self.fault_detection_df is None:
+            self.load_fault_detection()
+        
+        # Filter fault detection data for the given sub_experiment_id
+        fault_data = self.fault_detection_df[self.fault_detection_df['sub_experiment_id'] == sub_exp_id]
+        if fault_data.empty:
+            print(f"No fault detection data found for sub-experiment {sub_exp_id}.")
+        else:
+            fault_data = fault_data.copy()  # To avoid SettingWithCopyWarning
+            fault_data['start_time'] = pd.to_datetime(fault_data['start_time'])
+            fault_data['end_time'] = pd.to_datetime(fault_data['end_time'])
+            # Plot vertical lines for fault detection start and end times.
+            # We only label the first occurrence of the vertical line to avoid duplicate legend entries.
+            fault_start_plotted = False
+            fault_end_plotted = False
+            fault_start = None
+            seen_alert_times = set()
+            for _, row in fault_data.iterrows():
+
+                fault_start = row['start_time']
+                fault_end = row['end_time']
+                """ if not fault_start_plotted:
+                    plt.axvline(
+                        x=fault_start, color='red', linestyle='--', linewidth=1.5, label="Fault Start"
+                    )
+                    fault_start_plotted = True
+                else:
+                    plt.axvline(
+                        x=fault_start, color='red', linestyle='--', linewidth=1.5
+                    )
+                if not fault_end_plotted:
+                    plt.axvline(
+                        x=fault_end, color='blue', linestyle='--', linewidth=1.5, label="Fault End"
+                    )
+                    fault_end_plotted = True
+                else:
+                    plt.axvline(
+                        x=fault_end, color='blue', linestyle='--', linewidth=1.5
+                    ) """
+                # Plot the alerts (convert alert times to datetime)
+                for true_positive in row['true_positives']:
+                    alert_time = pd.to_datetime(true_positive['time'])
+                    if alert_time not in seen_alert_times:
+                        plt.axvline(
+                            x=alert_time, color='green', linestyle='--', linewidth=1.5
+                        )
+                        seen_alert_times.add(alert_time)
+                for false_positive in row['false_positives']:
+                    alert_time = pd.to_datetime(false_positive['time'])
+                    if alert_time not in seen_alert_times:
+                        plt.axvline(
+                            x=alert_time, color='red', linestyle='--', linewidth=1.5
+                        )
+                        seen_alert_times.add(alert_time)
+                break
+        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.tight_layout()
+        output_file = f"{self.plots_out_dir}/trace_with_fault_detection_subexp_{sub_exp_id}.png"
+        plt.savefig(output_file, bbox_inches="tight")
+        plt.close()
+        print(f"Plot saved to {output_file}")
 
     def analyse_raw_alerts(self):
         """Analyse the raw alerts and verify if they triggered during fault injection periods."""
@@ -608,6 +760,94 @@ class ExperimentAnalyzer:
         plt.savefig(f'{self.plots_out_dir}/alerts_during_faults_and_outside_faults.png')
         plt.close()
 
+    def analyse_traces(self):
+        """Analyse the traces timing and counts per sub-experiment."""
+        self.load_traces()
+        
+        print("\nTrace Analysis Summary:")
+        print("=" * 50)
+        
+        # Group traces by sub-experiment
+        for sub_exp_id, traces_group in self.traces_df.groupby('sub_experiment_id'):
+            print(f"\nSub-experiment {sub_exp_id}:")
+            
+            # Get experiment parameters for context
+            if self.params_mapping and sub_exp_id in self.params_mapping:
+                params = self.params_mapping[sub_exp_id]
+                print(f"Configuration:")
+                print(f"- Latency threshold: {params.get('treatments.0.kubernetes_prometheus_rules.params.latency_threshold', 'N/A')}")
+                print(f"- Evaluation window: {params.get('treatments.0.kubernetes_prometheus_rules.params.evaluation_window', 'N/A')}")
+            
+            # Time analysis
+            start_time = pd.to_datetime(traces_group['start_time'].min(), unit='us')
+            end_time = pd.to_datetime(traces_group['start_time'].max(), unit='us')
+            duration = (end_time - start_time).total_seconds()
+            
+            print("\nTiming:")
+            print(f"- Start time: {start_time}")
+            print(f"- End time: {end_time}")
+            print(f"- Duration: {duration:.2f} seconds")
+            
+            # Count analysis
+            total_traces = len(traces_group)
+            traces_per_second = total_traces / duration if duration > 0 else 0
+            
+            print("\nCounts:")
+            print(f"- Total traces: {total_traces}")
+            print(f"- Traces per second: {traces_per_second:.2f}")
+            
+            # Service breakdown
+            print("\nService breakdown:")
+            service_counts = traces_group['service_name'].value_counts()
+            for service, count in service_counts.items():
+                percentage = (count / total_traces) * 100
+                print(f"- {service}: {count} traces ({percentage:.1f}%)")
+            
+            # Operation breakdown (top 5)
+            print("\nTop 5 operations:")
+            op_counts = traces_group['operation'].value_counts().head()
+            for op, count in op_counts.items():
+                percentage = (count / total_traces) * 100
+                print(f"- {op}: {count} traces ({percentage:.1f}%)")
+            
+            # Duration statistics (in milliseconds)
+            durations_ms = traces_group['duration'] / 1000
+            print("\nDuration statistics (ms):")
+            print(f"- Mean: {durations_ms.mean():.2f}")
+            print(f"- Median: {durations_ms.median():.2f}")
+            print(f"- 95th percentile: {durations_ms.quantile(0.95):.2f}")
+            print(f"- Max: {durations_ms.max():.2f}")
+            
+            print("-" * 50)
+        
+        # Create summary visualization
+        plt.figure(figsize=(15, 10))
+        
+        # Plot 1: Trace counts by sub-experiment and service
+        plt.subplot(2, 1, 1)
+        trace_counts = self.traces_df.groupby(['sub_experiment_id', 'service_name']).size().unstack()
+        trace_counts.plot(kind='bar', stacked=True)
+        plt.title('Trace Counts by Sub-experiment and Service')
+        plt.xlabel('Sub-experiment ID')
+        plt.ylabel('Number of Traces')
+        plt.legend(title='Service', bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        # Plot 2: Duration distribution by sub-experiment
+        plt.subplot(2, 1, 2)
+        sns.boxplot(
+            data=self.traces_df,
+            x='sub_experiment_id',
+            y='duration',
+            showfliers=False  # Exclude outliers for better visualization
+        )
+        plt.title('Trace Duration Distribution by Sub-experiment')
+        plt.xlabel('Sub-experiment ID')
+        plt.ylabel('Duration (microseconds)')
+        
+        plt.tight_layout()
+        plt.savefig(f'{self.plots_out_dir}/trace_analysis_summary.png', bbox_inches='tight')
+        plt.close()
+
 def main():
     parser = argparse.ArgumentParser(description='Analyze experiment traces')
     parser.add_argument('directory', help='Directory containing experiment files')
@@ -616,7 +856,7 @@ def main():
 
 
 
-    service_filter = ["adservice"]
+    service_filter = ["recommendationservice"]
 
     analyzer = ExperimentAnalyzer(args.directory, args.treatment_type, service_filter)
     analyzer.plots_out_dir = args.directory + "/plots"
@@ -627,6 +867,7 @@ def main():
     analyzer.analyse_fault_detection(fault_filter_out=["kubernetes_prometheus_rules", "add_security_context"])
     analyzer.plot_fault_detection_metrics()
     analyzer.plot_trace_duration_by_service(service_filter=service_filter)
-    analyzer.analyse_raw_alerts()
+    #analyzer.analyse_raw_alerts()
+    analyzer.analyse_traces()
 if __name__ == "__main__":
     main()
